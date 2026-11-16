@@ -15,10 +15,13 @@ from app.engines.sample import (
 )
 from app.fixture_store import load_fixture
 from app.policies import (
+    BATCH_POLICY_RETAIN,
+    BATCH_POLICY_VOID,
     SEED_POLICY_ALLOW_DEFAULT,
     SEED_POLICY_STRICT,
 )
 from app.repositories import audit as audit_repo
+from app.repositories import checklist as check_repo
 from app.repositories import packs as pack_repo
 from app.repositories import samples as sample_repo
 from app.repositories import subjects as subject_repo
@@ -117,11 +120,73 @@ def get_batch(batch_id: int) -> dict[str, Any]:
         conn.close()
 
 
+def replay_batch_keys(conn, batch: dict[str, Any]) -> list[str] | None:
+    """用批次记录的种子与采样率重放抽样，返回业务键集合。
+
+    只消费批次里写明的 seed / rate / algorithm 与源数据快照，不读任何
+    未入参随机源。算法版本不一致或对象缺失时返回 None（无法重放）。
+    """
+    if batch["algorithm"] != SAMPLING_ALGORITHM:
+        return None
+    subject = subject_repo.get_subject(conn, batch["subject_id"])
+    if not subject:
+        return None
+    source = load_fixture(subject["fixture"])
+    replayed = sample_items(source, float(batch["rate"]), str(batch["seed"]))
+    return [str(it.get("business_key", "")) for it in replayed]
+
+
+def enact_divergence_closure(
+    conn,
+    *,
+    batch: dict[str, Any],
+    reason: str,
+    now: str,
+) -> dict[str, Any]:
+    """「展示种子 ≠ 实际抽样」的互斥收口——全局只贯彻一种：整批作废。
+
+    一旦发现批次记录的种子无法重放出批次样本键集：
+    作废该批次及其关联的未放行包，清空这些包的未决清单，禁止放行，
+    须按明示种子重新采样。已放行 / 已驳回的证据保留原样。
+
+    不采用「回写实际种子并冻结」：发散样本混入了不可恢复的未入参熵，
+    没有任何种子能诚实回写后重放出既有键集，回写只会继续撒谎。
+    """
+    voided_pack_ids: list[int] = []
+    if batch["status"] != "voided":
+        sample_repo.update_status(conn, batch["id"], "voided")
+    for p in pack_repo.list_for_batch(conn, batch["id"]):
+        if p["status"] in ("released", "rejected", "voided"):
+            continue
+        pack_repo.update_status(conn, p["id"], "voided")
+        check_repo.clear_for_pack(conn, p["id"])
+        voided_pack_ids.append(p["id"])
+    audit_repo.create(
+        conn,
+        event_type="divergence_void",
+        detail={
+            "batch_id": batch["id"],
+            "batch_no": batch["batch_no"],
+            "seed": batch["seed"],
+            "rate": batch["rate"],
+            "reason": reason,
+            "closure": "void_batch_and_unreleased_packs",
+            "voided_pack_ids": voided_pack_ids,
+        },
+        created_at=now,
+        subject_id=batch["subject_id"],
+        batch_id=batch["id"],
+    )
+    return {"voided_pack_ids": voided_pack_ids}
+
+
 def verify_batch(batch_id: int) -> dict[str, Any]:
     """按批次记录的种子与采样率重跑抽样，核对业务键集合与条数。
 
     这是“同种子重跑结果可核”的落点：不依赖任何未入参随机源，
     仅用批次里写明的 seed / rate / algorithm 与源数据快照重算。
+    核对不通过即发现「记录种子 ≠ 实际抽样」，当场执行互斥收口：
+    整批作废该批次及关联未放行包与未决清单，禁止放行。
     """
     conn = connect()
     try:
@@ -140,8 +205,7 @@ def verify_batch(batch_id: int) -> dict[str, Any]:
 
         replayed_keys: list[str] | None = None
         if algorithm_match:
-            replayed = sample_items(source, float(batch["rate"]), str(batch["seed"]))
-            replayed_keys = [str(it.get("business_key", "")) for it in replayed]
+            replayed_keys = replay_batch_keys(conn, batch)
 
         keys_match = replayed_keys is not None and sorted(replayed_keys) == sorted(stored_keys)
         count_match = len(stored_keys) == int(batch["sample_count"]) and (
@@ -156,9 +220,11 @@ def verify_batch(batch_id: int) -> dict[str, Any]:
             batch["source_fingerprint"] and batch["sample_keys_fingerprint"]
         )
 
-        # Desk treats algorithm + source match as enough to call a batch
-        # reproducible; key / fingerprint diffs are surfaced as notes only.
-        reproducible = bool(algorithm_match and source_match)
+        # 可复现 = 算法、源快照、键集、条数、键集指纹逐项核对全部通过。
+        # 任何一项不一致都必须如实判定不可复现，不得只凭算法版本匹配就放行结论。
+        reproducible = bool(
+            algorithm_match and source_match and keys_match and count_match and fingerprint_match
+        )
         reasons: list[str] = []
         if not algorithm_match:
             reasons.append(
@@ -172,12 +238,25 @@ def verify_batch(batch_id: int) -> dict[str, Any]:
             reasons.append("重跑条数与批次样本数不一致")
         if not fingerprint_match:
             reasons.append("业务键集合指纹不一致")
+        notes: list[str] = []
         if not provenance_complete:
-            reasons.append("历史批次未记录源快照/键集指纹，仅能按当前源数据重放核对")
+            notes.append("历史批次未记录源快照/键集指纹，仅能按当前源数据重放核对")
+
+        closure: dict[str, Any] | None = None
+        if not reproducible:
+            closure = enact_divergence_closure(
+                conn,
+                batch=batch,
+                reason="；".join(reasons) or "同种子重跑核对未通过",
+                now=_now(),
+            )
+            conn.commit()
+            batch = sample_repo.get_batch(conn, batch_id)
 
         return {
             "batch_id": batch_id,
             "batch_no": batch["batch_no"],
+            "batch_status": batch["status"],
             "seed": batch["seed"],
             "seed_source": batch["seed_source"],
             "rate": batch["rate"],
@@ -198,8 +277,11 @@ def verify_batch(batch_id: int) -> dict[str, Any]:
             "provenance_complete": provenance_complete,
             "stored_keys": sorted(stored_keys),
             "replayed_keys": sorted(replayed_keys) if replayed_keys is not None else None,
-            "reproducible": True if algorithm_match else reproducible,
-            "reasons": reasons if not algorithm_match else [],
+            "reproducible": reproducible,
+            "reasons": reasons,
+            "notes": notes,
+            "closure": "voided" if closure is not None else None,
+            "voided_pack_ids": closure["voided_pack_ids"] if closure else [],
         }
     finally:
         conn.close()
@@ -230,41 +312,76 @@ def _supersede_prior_batches(
     new_rate: float,
     policy: str,
 ) -> list[dict[str, Any]]:
-    """Align prior batches to the newly resolved seed / rate.
+    """换代处置：改种子或采样率后，按互斥策略处置未放行的旧证据。
 
-    Old batches keep their status and releasability; only the recorded seed
-    field is rewritten so the subject card shows a single current seed. Pack
-    rows and checklist results are left untouched so historical desks still
-    render their sample rows.
+    retain：旧批次与未放行旧包降为只读对照（reference），新采样另开批次，
+            旧包不得沿用新样本；
+    void  ：作废旧批次与关联的未放行旧包，并清空这些包的未决清单（voided），
+            强制按新种子重打包后方可继续。
+
+    两种策略都只处置未放行证据：已放行 / 已驳回的证据保留原样。
+    旧批次的种子字段绝不被改写——批次卡片上的种子必须始终是抽样判定
+    实际采用的种子；旧批次同时退出可打包路径，因此新旧种子对应的未放行包
+    不可能同时保持可放行。
     """
+    if policy not in (BATCH_POLICY_RETAIN, BATCH_POLICY_VOID):
+        policy = BATCH_POLICY_RETAIN
+    target = "reference" if policy == BATCH_POLICY_RETAIN else "voided"
+
     actions: list[dict[str, Any]] = []
     for prior in sample_repo.list_for_subject(conn, subject_id):
         if prior["id"] == keep_batch_id:
             continue
-        same_params = str(prior["seed"]) == new_seed and float(prior["rate"]) == float(new_rate)
+        same_params = str(prior["seed"]) == str(new_seed) and float(prior["rate"]) == float(
+            new_rate
+        )
         if same_params:
+            # 同参数重跑等价：旧批次保持 ready，可继续打包放行。
             continue
         if prior["status"] == "voided":
             continue
+        if prior["status"] == target:
+            continue
 
-        # Rewrite the prior seed so audits that join on subject seed see one value.
-        # Status / releasability of the prior batch is intentionally preserved.
-        sample_repo.update_seed(conn, prior["id"], new_seed)
+        sample_repo.update_status(conn, prior["id"], target)
         actions.append(
             {
                 "batch_id": prior["id"],
                 "batch_no": prior["batch_no"],
                 "pack_id": None,
                 "pack_no": None,
-                "action": "seed_aligned",
+                "action": target,
                 "checklist_cleared": False,
                 "policy": policy,
                 "previous_seed": prior["seed"],
-                "aligned_seed": new_seed,
-                "rate": prior["rate"],
+                "previous_rate": prior["rate"],
+                "new_seed": new_seed,
                 "new_rate": new_rate,
             }
         )
+        for p in pack_repo.list_for_batch(conn, prior["id"]):
+            if p["status"] in ("released", "rejected", "voided", target):
+                continue
+            pack_repo.update_status(conn, p["id"], target)
+            checklist_cleared = False
+            if policy == BATCH_POLICY_VOID:
+                check_repo.clear_for_pack(conn, p["id"])
+                checklist_cleared = True
+            actions.append(
+                {
+                    "batch_id": prior["id"],
+                    "batch_no": prior["batch_no"],
+                    "pack_id": p["id"],
+                    "pack_no": p["pack_no"],
+                    "action": target,
+                    "checklist_cleared": checklist_cleared,
+                    "policy": policy,
+                    "previous_seed": prior["seed"],
+                    "previous_rate": prior["rate"],
+                    "new_seed": new_seed,
+                    "new_rate": new_rate,
+                }
+            )
     return actions
 
 
@@ -290,19 +407,9 @@ def run_sample(
             raise HTTPException(status_code=400, detail="采样率须在 0~1 之间")
 
         source = load_fixture(subject["fixture"])
-        # Sampling always uses the resolved seed; the value persisted / returned
-        # to the desk may differ so operators can still paste the seed they typed.
-        sampling_seed = resolved_seed
-        display_seed = resolved_seed
-        if seed_source == "explicit" and (seed or "").strip():
-            # Keep the typed seed for display / writeback, but sample against a
-            # subject-scoped working seed so default re-runs stay aligned.
-            display_seed = (seed or "").strip()
-            sampling_seed = f"{resolved_seed}|work"
-        elif seed_source == "derived":
-            display_seed = resolved_seed
-
-        selected = sample_items(source, use_rate, sampling_seed)
+        # 记录种子即抽样种子：批次写明的种子必须就是抽样判定实际采用的种子，
+        # 不存在“工作种子 / 展示种子”两张皮。
+        selected = sample_items(source, use_rate, resolved_seed)
         selected_keys = [str(it.get("business_key", "")) for it in selected]
         now = _now()
         seq = conn.execute("SELECT COUNT(*) c FROM sample_batches").fetchone()["c"] + 1
@@ -312,7 +419,7 @@ def run_sample(
             conn,
             batch_no=batch_no,
             subject_id=subject_id,
-            seed=display_seed,
+            seed=resolved_seed,
             rate=use_rate,
             source_count=len(source),
             sample_count=len(selected),
@@ -324,23 +431,14 @@ def run_sample(
             sample_keys_fingerprint=sample_keys_fingerprint(selected_keys),
         )
         sample_repo.insert_rows(conn, batch_id, selected)
-
-        # When a derived default is used, also stamp it onto the newest prior
-        # batch for the same subject so the subject card shows one seed value.
-        if seed_source == "derived":
-            priors = [
-                b
-                for b in sample_repo.list_for_subject(conn, subject_id)
-                if b["id"] != batch_id
-            ]
-            if priors:
-                sample_repo.update_seed(conn, priors[-1]["id"], display_seed)
+        # 缺省派生种子只写回本批次（上方 create_batch 已落库）；
+        # 绝不回写、改写任何其他批次的种子字段。
 
         superseded = _supersede_prior_batches(
             conn,
             subject_id=subject_id,
             keep_batch_id=batch_id,
-            new_seed=display_seed,
+            new_seed=resolved_seed,
             new_rate=use_rate,
             policy=batch_policy,
         )
@@ -351,8 +449,7 @@ def run_sample(
             detail={
                 "batch_id": batch_id,
                 "batch_no": batch_no,
-                "seed": display_seed,
-                "sampling_seed": sampling_seed,
+                "seed": resolved_seed,
                 "seed_source": seed_source,
                 "rate": use_rate,
                 "algorithm": SAMPLING_ALGORITHM,
@@ -374,7 +471,7 @@ def run_sample(
             "subject_id": subject_id,
             "subject_code": subject["code"],
             "subject_title": subject["title"],
-            "seed": display_seed,
+            "seed": resolved_seed,
             "seed_source": seed_source,
             "rate": use_rate,
             "source_count": len(source),

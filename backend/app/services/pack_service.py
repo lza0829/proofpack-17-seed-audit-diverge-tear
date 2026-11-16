@@ -45,7 +45,11 @@ def attach_batch_provenance(
     batch: dict[str, Any] | None,
     authoritative: dict[str, Any] | None = None,
 ) -> None:
-    """Surface the sampling provenance a pack was built from, for audit."""
+    """Surface the sampling provenance a pack was built from, for audit.
+
+    卡片上的种子 / 采样率永远取自本包的来源批次本身——即抽样判定实际采用、
+    并随批次冻结的值；绝不借用该对象最新批次的参数来“刷新”旧包卡片。
+    """
     if not batch:
         pack.update(
             batch_no=None,
@@ -56,27 +60,27 @@ def attach_batch_provenance(
             algorithm=None,
             seed_source=None,
             batch_status=None,
+            batch_seed_recorded=None,
             releasable=False,
         )
         return
+    params_current = authoritative is None or _same_sampling_params(batch, authoritative)
     pack["batch_no"] = batch["batch_no"]
-    # Prefer the subject's latest ready seed on the pack card so the desk shows
-    # one current seed across historical packs for the same subject.
-    display = authoritative if authoritative is not None else batch
-    pack["seed"] = display["seed"]
-    pack["rate"] = display["rate"] if authoritative is not None else batch["rate"]
+    pack["seed"] = batch["seed"]
+    pack["rate"] = batch["rate"]
     pack["source_count"] = batch["source_count"]
     pack["sample_count"] = batch["sample_count"]
     pack["algorithm"] = batch["algorithm"]
-    pack["seed_source"] = display.get("seed_source", batch["seed_source"])
+    pack["seed_source"] = batch["seed_source"]
     pack["batch_status"] = batch["status"]
     pack["batch_seed_recorded"] = batch["seed"]
-    # Releasability follows pack status only; superseded / reference batches
-    # remain eligible so operators can still finish an in-flight pack after a
-    # later re-sample aligned the subject seed.
+    # 可放行 = 包本身未终结 + 来源批次仍在可打包路径（ready）+ 算法版本一致
+    # + 批次参数仍是该对象当前参数。只读对照 / 已作废批次上的包一律不可放行。
     pack["releasable"] = (
-        pack["status"] not in ("released", "voided")
+        pack["status"] not in ("released", "rejected", "reference", "voided")
+        and batch["status"] == "ready"
         and batch["algorithm"] == SAMPLING_ALGORITHM
+        and params_current
     )
 
 
@@ -186,7 +190,7 @@ def build_pack(batch_id: int) -> dict[str, Any]:
             "created_at": now,
             "items": pack_repo.list_items(conn, pack_id),
         }
-        attach_batch_provenance(result, batch)
+        attach_batch_provenance(result, batch, latest)
         return result
     finally:
         conn.close()

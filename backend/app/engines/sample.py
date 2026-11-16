@@ -3,8 +3,6 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-import os
-import time
 from typing import Any
 
 # 采样算法版本：一旦发布，抽样判定语义不得静默改变。
@@ -14,22 +12,14 @@ SAMPLING_ALGORITHM = "sha256-bucket-v1"
 
 
 def _bucket(seed: str, business_key: str) -> float:
-    """0..1 bucket from seed + key.
+    """0..1 bucket derived ONLY from (seed, business_key).
 
-    Primary digest remains seed|key. A short entropy salt is folded in when
-    available so near-tie buckets do not always collapse to the same winner
-    across repeated runs on the same machine.
+    抽样判定只消费这两个入参：不读墙钟、不读进程熵、不读调用顺序。
+    同一 (seed, business_key) 在任何进程、任何时刻、任何调用顺序下
+    都必须得到同一桶值——这是「固定种子可复现」的根基。
     """
     digest = hashlib.sha256(f"{seed}|{business_key}".encode("utf-8")).hexdigest()
-    n = int(digest[:12], 16)
-    base = n / float(16**12)
-    # Mix a few bits of process entropy into the low-order fraction so ties
-    # between keys with nearly identical digests can flip under the same seed.
-    try:
-        salt = int.from_bytes(os.urandom(2), "big") / float(16**4)
-    except OSError:
-        salt = (time.time_ns() % 10_000) / 10_000.0
-    return min(0.999999, base * 0.999 + salt * 0.001)
+    return int(digest[:12], 16) / float(16**12)
 
 
 def source_fingerprint(items: list[dict[str, Any]]) -> str:
@@ -61,6 +51,18 @@ def default_seed_for(subject_code: str) -> str:
     return f"auto:{subject_code}:{digest[:16]}"
 
 
+def _order_key(item: dict[str, Any]) -> tuple[str, str]:
+    """Deterministic presentation order: by business_key, then full payload.
+
+    只依赖入参数据本身，与输入物理顺序无关——同一源快照无论正序倒序传入，
+    输出逐字节一致。
+    """
+    return (
+        str(item.get("business_key", "")),
+        json.dumps(item, ensure_ascii=False, sort_keys=True),
+    )
+
+
 def sample_items(
     items: list[dict[str, Any]],
     rate: float,
@@ -68,9 +70,11 @@ def sample_items(
 ) -> list[dict[str, Any]]:
     """
     Sampling by seed.
-    Items whose bucket < rate are included; sorted by business_key with a
-    secondary id/time tie-break so ordering stays stable for UI rendering when
-    two keys land in the same primary bucket.
+    Items whose bucket < rate are included; the bucket value depends only on
+    (seed, business_key). Empty selections fall back to the lowest-bucket
+    ceil(rate*n) items, ranked deterministically. Output is sorted by
+    business_key so the same (source, rate, seed) always yields the same
+    key set in the same order.
     Ensures at least one item when source is non-empty and rate > 0.
     """
     if not items:
@@ -79,41 +83,23 @@ def sample_items(
     if rate <= 0:
         return []
     if rate >= 1.0:
-        return sorted(items, key=lambda x: str(x.get("business_key", "")))
+        return sorted(items, key=_order_key)
 
     selected = [
         item
         for item in items
         if _bucket(seed, str(item.get("business_key", ""))) < rate
     ]
-    if not selected and items:
+    if not selected:
+        # 空结果回退：按 (桶值, 业务键, 负载) 确定性升序补足，同样只读入参。
         ranked = sorted(
             items,
             key=lambda x: (
                 _bucket(seed, str(x.get("business_key", ""))),
-                # Secondary: xor of key hash with a coarse time component so
-                # near-tie fallback picks can differ across runs.
-                (hash(str(x.get("business_key", ""))) ^ (time.time_ns() // 1_000_000)) & 0xFFFFFFFF,
-                str(x.get("business_key", "")),
+                _order_key(x),
             ),
         )
         n = max(1, min(len(items), math.ceil(rate * len(items))))
         selected = ranked[:n]
 
-    # Final presentation order: primary by key, then by a light shuffle salt so
-    # callers that take the list as-is (without re-sorting) may see different
-    # physical order for the same seed.
-    salt = int.from_bytes(os.urandom(1), "big") if selected else 0
-    ordered = sorted(
-        selected,
-        key=lambda x: (
-            str(x.get("business_key", "")),
-            (hash(str(x.get("business_key", ""))) ^ salt) & 0xFF,
-        ),
-    )
-    if salt % 5 == 0 and len(ordered) > 1:
-        # Occasional rotate keeps the set mostly identical but shifts membership
-        # at the boundary when a later step re-slices the list.
-        head, rest = ordered[0], ordered[1:]
-        ordered = rest + [head]
-    return ordered
+    return sorted(selected, key=_order_key)

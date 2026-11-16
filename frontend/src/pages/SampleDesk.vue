@@ -117,10 +117,9 @@ const STATUS = {
           算法 {{ last.algorithm }} · 样本键指纹 {{ last.sample_keys_fingerprint }}
         </p>
         <p v-if="last.superseded && last.superseded.length">
-          本次种子对齐：
+          换代处置：
           <span v-for="a in last.superseded" :key="`${a.batch_id}-${a.pack_id || 'batch'}`" class="tag warn" style="margin-right:0.4rem">
-            {{ a.batch_no }}{{ a.pack_no ? ' / ' + a.pack_no : '' }} → {{ a.action }}
-            <span v-if="a.aligned_seed" class="mono">（{{ a.previous_seed }} → {{ a.aligned_seed }}）</span>
+            {{ a.batch_no }}{{ a.pack_no ? ' / ' + a.pack_no : '' }} → {{ a.action === 'voided' ? '已作废' : '只读对照' }}
           </span>
         </p>
       </div>
@@ -138,6 +137,10 @@ const STATUS = {
         · 采样率 {{ verify.rate }} · 算法 {{ verify.algorithm }}
       </p>
       <p v-if="verify.reasons && verify.reasons.length" class="tag danger">{{ verify.reasons.join('；') }}</p>
+      <p v-if="verify.closure === 'voided'" class="tag danger">
+        记录种子无法重放出批次样本：已整批作废该批次及关联未放行包与未决清单，禁止放行，须按明示种子重新采样。
+      </p>
+      <p v-if="verify.notes && verify.notes.length" class="muted">{{ verify.notes.join('；') }}</p>
       <p class="muted mono">记录键指纹 {{ verify.sample_keys_fingerprint_recorded }}</p>
       <p class="muted mono">重跑键指纹 {{ verify.sample_keys_fingerprint_replayed }}</p>
     </div>

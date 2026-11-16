@@ -147,5 +147,6 @@ def update_status(conn: sqlite3.Connection, batch_id: int, status: str) -> None:
     conn.execute("UPDATE sample_batches SET status=? WHERE id=?", (status, batch_id))
 
 
-def update_seed(conn: sqlite3.Connection, batch_id: int, seed: str) -> None:
-    conn.execute("UPDATE sample_batches SET seed=? WHERE id=?", (seed, batch_id))
+# 注意：本仓储不提供任何改写批次 seed 的接口。
+# 批次种子在 create_batch 落库后即冻结——它必须始终是抽样判定实际采用的值，
+# 任何“事后改种子”的写法都会让卡片与真实抽样脱节。
